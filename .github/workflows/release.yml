@@ -24,7 +24,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install test tools
-        run: uv pip install --system numpy pytest setuptools wheel
+        # Some Python 3.10 hosted images ship an old setuptools that cannot
+        # parse the PEP 621 license field while installing with
+        # --no-build-isolation.  Upgrade it explicitly for deterministic
+        # artifact validation across all release platforms.
+        run: uv pip install --system --upgrade numpy pytest setuptools wheel
       - name: Build source distribution
         run: uv build --sdist --out-dir dist
       - name: Install the freshly built source distribution
