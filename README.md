@@ -45,7 +45,7 @@ UniLab DrakeBackend
 ## Build Batch Extension
 
 ```bash
-uv run python scripts/build_drake_batch.py --drake-home /Users/huanghaochen/solver/drake/install
+uv run python scripts/build_drake_batch.py --drake-home /path/to/drake/install
 ```
 
 The extension is written to `src/drake_uni/compiled/_drake_env_pool*.so`.
@@ -74,7 +74,7 @@ the native build contract, scope boundaries, and release workflow.
 From a consuming project:
 
 ```bash
-uv pip install -e /Users/huanghaochen/solver/drake_uni
+uv pip install -e /path/to/drake_uni
 ```
 
 ## Runtime API
