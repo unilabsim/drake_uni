@@ -128,6 +128,8 @@ class DrakeBatchRuntime:
             sensor_adr=self._model_contract.sensor_adr.copy(),
             sensor_dim=self._model_contract.sensor_dim.copy(),
             nsensordata=self._model_contract.nsensordata,
+            actuator_names=self._model_contract.actuator_names,
+            joint_body_names=self._model_contract.joint_layout_body_names,
         )
         self._physics_state = np.zeros((self._num_envs, int(self._pool.state_dim)), dtype=np.float64)
         self._sensor_data = np.zeros(
@@ -176,6 +178,8 @@ class DrakeBatchRuntime:
             sensor_adr=info.sensor_adr.copy(),
             sensor_dim=info.sensor_dim.copy(),
             nsensordata=info.nsensordata,
+            actuator_names=info.actuator_names,
+            joint_body_names=info.joint_body_names,
         )
 
     def keyframe_qpos(self, name: str) -> np.ndarray:

@@ -50,3 +50,7 @@ class DrakeModelInfo:
     sensor_adr: np.ndarray
     sensor_dim: np.ndarray
     nsensordata: int
+    # Names are kept optional for compatibility with runtimes created by
+    # older DrakeUni builds; current materialization always populates them.
+    actuator_names: tuple[str, ...] = ()
+    joint_body_names: tuple[str, ...] = ()

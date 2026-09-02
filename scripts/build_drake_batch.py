@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import shlex
 import subprocess
 import sysconfig
 from pathlib import Path
@@ -26,25 +27,57 @@ def _pkg_config_flags(package: str, option: str) -> list[str]:
     return result.stdout.split()
 
 
+def _include_flags(env_name: str, fallback: Path | None = None) -> list[str]:
+    """Return include flags from an override, falling back to a known path."""
+
+    values = [item for item in os.environ.get(env_name, "").split(os.pathsep) if item]
+    if not values and fallback is not None and fallback.is_dir():
+        values = [str(fallback)]
+    return [f"-I{value}" for value in values]
+
+
+def _library_flags(env_name: str) -> list[str]:
+    """Return ``-L`` flags for libraries outside the system search path."""
+
+    values = [item for item in os.environ.get(env_name, "").split(os.pathsep) if item]
+    return [f"-L{value}" for value in values]
+
+
 def build_command(drake_home: Path, output: Path) -> list[str]:
     python_include = Path(sysconfig.get_paths()["include"])
     pybind_include = drake_home / "include/pybind11"
+    eigen_flags = _pkg_config_flags("eigen3", "--cflags")
+    if not eigen_flags:
+        eigen_flags = _include_flags("EIGEN3_INCLUDE_DIR", drake_home / "include/eigen3")
+    fmt_include_flags = _include_flags("FMT_INCLUDE_DIR")
+    fmt_flags = _pkg_config_flags("fmt", "--cflags")
+    if fmt_include_flags:
+        fmt_flags.extend(fmt_include_flags)
     include_flags = [
         f"-I{python_include}",
         f"-I{drake_home / 'include'}",
         f"-I{pybind_include}",
-        *_pkg_config_flags("eigen3", "--cflags"),
-        *_pkg_config_flags("fmt", "--cflags"),
+        *eigen_flags,
+        *fmt_flags,
     ]
     lib_flags = [
         *_pkg_config_flags("fmt", "--libs"),
+        *_library_flags("FMT_LIB_DIR"),
     ]
+    if not any(flag == "-lfmt" for flag in lib_flags):
+        lib_flags.append("-lfmt")
     lib_dir = drake_home / "lib"
     python_link_flags = []
     if platform.system() == "Darwin":
         python_link_flags = ["-undefined", "dynamic_lookup"]
+    compiler = os.environ.get("CXX") or sysconfig.get_config_var("CXX") or "c++"
+    # CPython commonly reports ``g++ -pthread`` as its CXX value.  Keep
+    # user-supplied compiler flags while passing the executable and arguments
+    # separately to subprocess rather than treating the whole string as a
+    # filename.
+    compiler_command = shlex.split(compiler)
     return [
-        os.environ.get("CXX", sysconfig.get_config_var("CXX") or "c++"),
+        *compiler_command,
         "-std=c++20",
         "-O2",
         "-fPIC",

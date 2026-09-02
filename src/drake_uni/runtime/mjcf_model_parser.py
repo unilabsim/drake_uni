@@ -232,6 +232,10 @@ class DrakeMjcfModelContract:
         return np.asarray([actuator.kind for actuator in self.actuators], dtype=np.int32)
 
     @property
+    def actuator_names(self) -> tuple[str, ...]:
+        return tuple(actuator.name for actuator in self.actuators)
+
+    @property
     def actuator_gear(self) -> np.ndarray:
         return np.asarray([actuator.gear for actuator in self.actuators], dtype=np.float64)
 
