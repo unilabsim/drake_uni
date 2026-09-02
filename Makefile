@@ -19,6 +19,10 @@ build:
 	@test -n "$(DRAKE_HOME)" || (echo "usage: make build DRAKE_HOME=/path/to/drake/install" && exit 1)
 	uv run python scripts/build_drake_batch.py --drake-home "$(DRAKE_HOME)"
 
+# Descriptive alias for callers that mirror MuJoCoUni's `make mujoco` target.
+.PHONY: drake
+drake: build
+
 .PHONY: build-dry-run
 build-dry-run:
 	@test -n "$(DRAKE_HOME)" || (echo "usage: make build-dry-run DRAKE_HOME=/path/to/drake/install" && exit 1)
