@@ -16,7 +16,7 @@ wheels = [
 ]
 
 [[package]]
-name = "drakeuni"
+name = "drake-uni-runtime"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

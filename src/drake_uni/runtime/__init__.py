@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 
 def available_backends() -> dict[str, bool]:
-    from drakeuni.batch_env import batch_available
+    from drake_uni.batch_env import batch_available
 
     return {
         "batch": bool(batch_available()),
@@ -31,7 +31,7 @@ def create_runtime(config: DrakeBatchConfig):
 
 
 def batch_diagnostics() -> DrakeRuntimeDiagnostics:
-    from drakeuni.batch_env import batch_available, batch_import_error
+    from drake_uni.batch_env import batch_available, batch_import_error
 
     detail = batch_import_error()
     return DrakeRuntimeDiagnostics(

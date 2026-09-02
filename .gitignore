@@ -8,4 +8,4 @@ dist/
 *.egg-info/
 .DS_Store
 # Local native build output (the suffix is .so/.pyd/.dylib by platform).
-src/drakeuni/compiled/_drake_env_pool*
+src/drake_uni/compiled/_drake_env_pool*

@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repository.
 
 ## Project Overview
 
-This repository is **DrakeUni** (PyPI project `drakeuni`, version `0.1.0`), an
+This repository is **DrakeUni** (PyPI project `drake-uni-runtime`, version `0.1.0`), an
 experimental batch simulation runtime for the UniLab Drake backend. It keeps the
 MJCF-facing contract used by UniLab in Python and delegates batched physics
 stepping to an optional C++/pybind11 extension linked against a local Drake
@@ -13,12 +13,12 @@ reward, rollout, or training orchestration logic from UniLab.
 
 The layers are intentionally separated:
 
-- **MJCF contract/materializer** (`drakeuni.runtime.mjcf_model_parser`): parses
+- **MJCF contract/materializer** (`drake_uni.runtime.mjcf_model_parser`): parses
   UniLab scenes, expands inherited defaults, and creates a temporary
   Drake-compatible copy without modifying caller-owned assets.
-- **Python runtime** (`drakeuni.runtime`): validates configuration, owns model
+- **Python runtime** (`drake_uni.runtime`): validates configuration, owns model
   metadata and state/sensor arrays, and presents the stable integration API.
-- **Native executor** (`drakeuni.compiled._drake_env_pool`, C++20): owns Drake
+- **Native executor** (`drake_uni.compiled._drake_env_pool`, C++20): owns Drake
   diagrams/simulators and worker state, then executes batched reset/step/query
   operations. The extension is optional until it is built locally.
 
@@ -26,15 +26,15 @@ The intended call path is:
 
 ```text
 UniLab DrakeBackend
-  -> drakeuni.runtime
-      -> drakeuni.compiled.DrakeEnvPool
+  -> drake_uni.runtime
+      -> drake_uni.compiled.DrakeEnvPool
           -> Drake C++ simulation
 ```
 
 ## Repository Layout
 
 ```text
-src/drakeuni/
+src/drake_uni/
   __init__.py                 # lazy top-level exports
   batch_env.py                # stable native-pool import boundary
   runtime/
@@ -54,7 +54,7 @@ Makefile                      # sync/install/build/lint/test/package/clean
 .github/workflows/release.yml # sdist checks and tag-based PyPI publishing
 ```
 
-The generated extension (`src/drakeuni/compiled/_drake_env_pool*.so`, or the
+The generated extension (`src/drake_uni/compiled/_drake_env_pool*.so`, or the
 platform equivalent) is local build output and is ignored by Git.
 
 ## Build and Test Commands
@@ -117,7 +117,7 @@ the active Python ABI suffix. Do not commit that generated file.
   and modern standard-library typing.
 - Keep comments and docstrings in English; user-facing Chinese documentation
   may be added alongside the English README.
-- Preserve the lazy import boundary. Importing `drakeuni` should not eagerly
+- Preserve the lazy import boundary. Importing `drake_uni` should not eagerly
   import `pydrake` or require the optional native extension.
 - Keep asset/XML parsing and materialization on cold paths (construction,
   initialization, or cache creation). `step` and `reset` must operate on the
@@ -125,13 +125,13 @@ the active Python ABI suffix. Do not commit that generated file.
 
 ## Public API and Scope Boundaries
 
-The stable application entry point is `drakeuni.runtime`:
+The stable application entry point is `drake_uni.runtime`:
 
 ```python
-from drakeuni.runtime import DrakeBatchConfig, create_runtime
+from drake_uni.runtime import DrakeBatchConfig, create_runtime
 ```
 
-`drakeuni.batch_env.DrakeEnvPool` is a lower-level native boundary. Preserve
+`drake_uni.batch_env.DrakeEnvPool` is a lower-level native boundary. Preserve
 the exported names (`DrakeEnvPool`, `batch_available`, and
 `batch_import_error`) when changing the loader.
 

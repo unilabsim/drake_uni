@@ -461,7 +461,7 @@ def materialize_drake_compatible_mjcf(scene_path: str | Path) -> DrakeCompatible
     source_scene = Path(scene_path).expanduser().resolve()
     roots = _load_xml_roots(source_scene)
     defaults = _collect_default_classes(roots)
-    tempdir = TemporaryDirectory(prefix="drakeuni_mjcf_")
+    tempdir = TemporaryDirectory(prefix="drake_uni_mjcf_")
     temp_root = Path(tempdir.name)
     source_root = source_scene.parent
     copied_root = temp_root / source_root.name
@@ -817,7 +817,7 @@ def _expand_mjcf_defaults_in_file(
                     body.remove(child)
                     continue
                 if child.tag == "geom" and not attrs.get("name"):
-                    attrs["name"] = f"drakeuni_{path.parent.name}_{path.stem}_geom_{generated_geom_index}"
+                    attrs["name"] = f"drake_uni_{path.parent.name}_{path.stem}_geom_{generated_geom_index}"
                     generated_geom_index += 1
                 child.attrib.clear()
                 child.attrib.update(attrs)

@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from drakeuni.runtime.mjcf_model_parser import (
+from drake_uni.runtime.mjcf_model_parser import (
     ACTUATOR_KIND_DAMPER,
     ACTUATOR_KIND_GENERAL,
     ACTUATOR_KIND_MOTOR,

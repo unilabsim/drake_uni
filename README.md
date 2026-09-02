@@ -24,12 +24,12 @@ needed. Callers should not commit or pass pre-generated files such as
 
 ## Directory Roles
 
-`src/drakeuni/runtime/` is the Python-facing runtime interface. It owns the
+`src/drake_uni/runtime/` is the Python-facing runtime interface. It owns the
 public config/data contracts, MJCF contract parsing, Drake-compatible MJCF
 materialization, runtime construction, and the reset/step/sensor API used by
 UniLab.
 
-`src/drakeuni/compiled/` is the native extension layer. It contains the C++
+`src/drake_uni/compiled/` is the native extension layer. It contains the C++
 Drake batch pool source and the built pybind extension that performs batched
 physics stepping.
 
@@ -37,8 +37,8 @@ The intended call path is:
 
 ```text
 UniLab DrakeBackend
-  -> drakeuni.runtime
-      -> drakeuni.compiled.DrakeEnvPool
+  -> drake_uni.runtime
+      -> drake_uni.compiled.DrakeEnvPool
           -> Drake C++ simulation
 ```
 
@@ -48,7 +48,7 @@ UniLab DrakeBackend
 uv run python scripts/build_drake_batch.py --drake-home /Users/huanghaochen/solver/drake/install
 ```
 
-The extension is written to `src/drakeuni/compiled/_drake_env_pool*.so`.
+The extension is written to `src/drake_uni/compiled/_drake_env_pool*.so`.
 The Drake prefix must provide `include/drake`, `include/pybind11`, and the
 Drake shared library. The generated extension is local build output and is not
 committed.
@@ -74,13 +74,13 @@ the native build contract, scope boundaries, and release workflow.
 From a consuming project:
 
 ```bash
-uv pip install -e /Users/huanghaochen/solver/drakeuni
+uv pip install -e /Users/huanghaochen/solver/drake_uni
 ```
 
 ## Runtime API
 
 ```python
-from drakeuni.runtime import DrakeBatchConfig, create_runtime
+from drake_uni.runtime import DrakeBatchConfig, create_runtime
 
 runtime = create_runtime(
     DrakeBatchConfig(
@@ -92,5 +92,5 @@ runtime = create_runtime(
 )
 ```
 
-The preferred integration point is `drakeuni.runtime`. `DrakeEnvPool` and
+The preferred integration point is `drake_uni.runtime`. `DrakeEnvPool` and
 the compiled extension are lower-level implementation details.

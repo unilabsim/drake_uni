@@ -18,8 +18,8 @@ rollout 调度）由 UniLab backend/task 层负责。
 ## 目录结构
 
 ```text
-src/drakeuni/runtime/       # Python contract、materializer 和运行时
-src/drakeuni/compiled/      # C++ Drake 批量执行器源码和本地扩展
+src/drake_uni/runtime/       # Python contract、materializer 和运行时
+src/drake_uni/compiled/      # C++ Drake 批量执行器源码和本地扩展
 scripts/build_drake_batch.py # 针对本地 Drake 前缀编译扩展
 tests/                      # parser/materialization 测试
 ```
@@ -42,14 +42,14 @@ make build DRAKE_HOME=/path/to/drake/install
 make test-no-sync
 ```
 
-扩展会生成在 `src/drakeuni/compiled/_drake_env_pool*`，属于本地构建产物，
+扩展会生成在 `src/drake_uni/compiled/_drake_env_pool*`，属于本地构建产物，
 不会提交到 Git。CI 默认执行跨平台 Python lint/test 和 sdist 构建，不假定
 runner 上存在机器相关的 Drake 前缀。
 
 ## 运行时 API
 
 ```python
-from drakeuni.runtime import DrakeBatchConfig, create_runtime
+from drake_uni.runtime import DrakeBatchConfig, create_runtime
 
 runtime = create_runtime(
     DrakeBatchConfig(
@@ -61,4 +61,4 @@ runtime = create_runtime(
 )
 ```
 
-推荐从 `drakeuni.runtime` 进入；`DrakeEnvPool` 和编译扩展属于底层实现。
+推荐从 `drake_uni.runtime` 进入；`DrakeEnvPool` 和编译扩展属于底层实现。

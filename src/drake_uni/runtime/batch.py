@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from drakeuni.batch_env import DrakeEnvPool, batch_available, batch_import_error
+from drake_uni.batch_env import DrakeEnvPool, batch_available, batch_import_error
 
 from .mjcf_model_parser import (
     ROOT_QPOS_DIM,
