@@ -29,8 +29,8 @@ jobs:
         run: uv build --sdist --out-dir dist
       - name: Install the freshly built source distribution
         run: >-
-          uv pip install --system --no-build-isolation --no-deps --no-binary drake-uni-runtime
-          --no-cache --find-links dist --no-index drake-uni-runtime
+          uv pip install --system --no-build-isolation --no-deps --no-binary drake-uni
+          --no-cache --find-links dist --no-index drake-uni
       - name: Test installed artifact
         run: python -m pytest tests/ -q
       - uses: actions/upload-artifact@v4

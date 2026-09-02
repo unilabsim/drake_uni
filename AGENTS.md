@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repository.
 
 ## Project Overview
 
-This repository is **DrakeUni** (PyPI project `drake-uni-runtime`, version `0.1.0`), an
+This repository is **DrakeUni** (PyPI project `drake-uni`, version `0.1.0`), an
 experimental batch simulation runtime for the UniLab Drake backend. It keeps the
 MJCF-facing contract used by UniLab in Python and delegates batched physics
 stepping to an optional C++/pybind11 extension linked against a local Drake
