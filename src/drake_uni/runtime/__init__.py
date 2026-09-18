@@ -9,7 +9,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .types import DrakeBatchConfig, DrakeModelInfo, DrakeRuntimeDiagnostics
+from .types import (
+    NATIVE_MODEL_PROPERTIES_CONTRACT_VERSION,
+    DrakeBatchConfig,
+    DrakeModelInfo,
+    DrakeNativeModelProperties,
+    DrakeRuntimeDiagnostics,
+)
 
 if TYPE_CHECKING:
     from .batch import DrakeBatchRuntime
@@ -46,7 +52,9 @@ __all__ = [
     "DrakeBatchRuntime",
     "DrakeBatchConfig",
     "DrakeModelInfo",
+    "DrakeNativeModelProperties",
     "DrakeRuntimeDiagnostics",
+    "NATIVE_MODEL_PROPERTIES_CONTRACT_VERSION",
     "available_backends",
     "batch_diagnostics",
     "create_runtime",

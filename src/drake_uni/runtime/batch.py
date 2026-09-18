@@ -18,7 +18,13 @@ from .mjcf_model_parser import (
     read_keyframe_qpos,
     sensor_frames_as_pool_inputs,
 )
-from .types import DrakeBatchConfig, DrakeModelInfo, DrakeRuntimeDiagnostics
+from .types import (
+    NATIVE_MODEL_PROPERTIES_CONTRACT_VERSION,
+    DrakeBatchConfig,
+    DrakeModelInfo,
+    DrakeNativeModelProperties,
+    DrakeRuntimeDiagnostics,
+)
 
 
 class DrakeBatchRuntime:
@@ -131,6 +137,7 @@ class DrakeBatchRuntime:
             actuator_names=self._model_contract.actuator_names,
             joint_body_names=self._model_contract.joint_layout_body_names,
         )
+        self._native_model_properties: DrakeNativeModelProperties | None = None
         self._physics_state = np.zeros((self._num_envs, int(self._pool.state_dim)), dtype=np.float64)
         self._sensor_data = np.zeros(
             (self._num_envs, self._model_info.nsensordata),
@@ -181,6 +188,62 @@ class DrakeBatchRuntime:
             actuator_names=info.actuator_names,
             joint_body_names=info.joint_body_names,
         )
+
+    def native_model_properties(self) -> DrakeNativeModelProperties:
+        """Return a validated cold-path native model identity snapshot."""
+
+        if self._native_model_properties is None:
+            read_native = getattr(self._pool, "native_model_properties", None)
+            if not callable(read_native):
+                raise RuntimeError("DrakeEnvPool build does not expose native_model_properties")
+            raw = read_native()
+            if not isinstance(raw, dict):
+                raise RuntimeError("DrakeEnvPool native_model_properties must return a dict")
+            body_names = _require_output_strings(raw, "body_names")
+            geometry_names = _require_output_strings(raw, "geometry_names")
+            geometry_types = _require_output_strings(raw, "geometry_types")
+            geometry_collision = tuple(
+                _require_output_bool(value)
+                for value in _require_output_key(raw, "geometry_collision", len(geometry_names))
+            )
+            self._native_model_properties = DrakeNativeModelProperties(
+                contract_version=NATIVE_MODEL_PROPERTIES_CONTRACT_VERSION,
+                body_names=body_names,
+                body_masses=_require_output_array(
+                    raw,
+                    "body_masses",
+                    (len(body_names),),
+                    "DrakeEnvPool native_model_properties",
+                ),
+                body_coms=_require_output_array(
+                    raw,
+                    "body_coms",
+                    (len(body_names), 3),
+                    "DrakeEnvPool native_model_properties",
+                ),
+                body_inertias=_require_output_array(
+                    raw,
+                    "body_inertias",
+                    (len(body_names), 3, 3),
+                    "DrakeEnvPool native_model_properties",
+                ),
+                geometry_names=geometry_names,
+                geometry_body_indices=_require_output_integer_array(
+                    raw,
+                    "geometry_body_indices",
+                    (len(geometry_names),),
+                    "DrakeEnvPool native_model_properties",
+                ),
+                geometry_types=geometry_types,
+                geometry_collision=geometry_collision,
+                geometry_parameters=_require_output_array(
+                    raw,
+                    "geometry_parameters",
+                    (len(geometry_names), 3),
+                    "DrakeEnvPool native_model_properties",
+                ),
+            )
+        return self._native_model_properties
 
     def keyframe_qpos(self, name: str) -> np.ndarray:
         qpos = read_keyframe_qpos(self._model_file, str(name))
@@ -329,10 +392,51 @@ def _require_output_array(
     shape: tuple[int, ...],
     source: str,
 ) -> np.ndarray:
-    values = np.asarray(output[key], dtype=np.float64)
+    values = np.asarray(output[key])
+    if values.dtype != np.dtype(np.float64):
+        raise RuntimeError(f"{source} {key} must contain float64 values")
     if values.shape != shape:
         raise RuntimeError(f"{source} {key} must have shape {shape}, got {values.shape}")
+    return values.copy()
+
+
+def _require_output_key(output: dict[str, Any], key: str, length: int | None) -> tuple[Any, ...]:
+    try:
+        values = tuple(output[key])
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"DrakeEnvPool native_model_properties {key} must be a sequence"
+        ) from exc
+    if length is not None and len(values) != length:
+        raise RuntimeError(
+            "DrakeEnvPool native_model_properties "
+            f"{key} must have length {length}, got {len(values)}"
+        )
     return values
+
+
+def _require_output_strings(output: dict[str, Any], key: str) -> tuple[str, ...]:
+    values = _require_output_key(output, key, None)
+    if any(not isinstance(value, str) for value in values):
+        raise RuntimeError(f"DrakeEnvPool native_model_properties {key} must contain strings")
+    return values
+
+
+def _require_output_bool(value: Any) -> bool:
+    if type(value) is not bool:
+        raise RuntimeError("DrakeEnvPool native_model_properties collision flags must be bools")
+    return value
+
+
+def _require_output_integer_array(
+    output: dict[str, Any], key: str, shape: tuple[int, ...], source: str
+) -> np.ndarray:
+    values = np.asarray(output[key])
+    if values.dtype.kind not in "iu":
+        raise RuntimeError(f"{source} {key} must contain integers")
+    if values.shape != shape:
+        raise RuntimeError(f"{source} {key} must have shape {shape}, got {values.shape}")
+    return values.astype(np.int32, copy=True)
 
 
 def _pydrake_loaded() -> bool:

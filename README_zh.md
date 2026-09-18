@@ -62,3 +62,28 @@ runtime = create_runtime(
 ```
 
 推荐从 `drake_uni.runtime` 进入；`DrakeEnvPool` 和编译扩展属于底层实现。
+
+## 原生模型属性回读
+
+`DrakeBatchRuntime.native_model_properties()` 返回物化后 Drake 模型的冷路径
+版本化快照，不会把 Drake 对象暴露给调用方。当前属性 contract 版本为 1。
+
+```python
+properties = runtime.native_model_properties()
+assert properties.contract_version == 1
+```
+
+快照包含：
+
+- Drake body 顺序、名称、默认质量、COM 和完整 3×3 转动惯量。惯量以 body
+  原点为参考点、在 body 坐标系中表示；焊接的 world body 报告为质量、COM
+  和惯量均为零的静态 body。
+- SceneGraph geometry 按 body 索引和名称排序，包含规范化名称、所属 body
+  索引、primitive 类型、原生参数以及 proximity/collision 角色标记。数值
+  数组为脱离来源的只读数组。
+
+Primitive 参数每个 geometry 固定打包为三个原生值：sphere 为
+`(radius, 0, 0)`；box 和 ellipsoid 使用三个完整长度/轴长；capsule 和
+cylinder 使用 `(radius, length, 0)`；half-space 全为零。mesh、convex mesh
+以及其他无法用标量精确表达内容身份的形状会 fail closed，不会返回误导性
+参数。
