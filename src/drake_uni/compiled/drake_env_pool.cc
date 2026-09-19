@@ -613,24 +613,10 @@ class DrakeEnvPool {
     const auto qvel_dim = joint_layout_qvel_dim_.unchecked<1>();
     const int joint_count = static_cast<int>(joint_layout_names_.size());
 
-    std::vector<const Joint<double>*> one_dof_joints;
-    for (int i = 0; i < plant_->num_joints(); ++i) {
-      const Joint<double>& joint = plant_->get_joint(JointIndex(i));
-      if (joint.num_positions() == 1 && joint.num_velocities() == 1) {
-        one_dof_joints.push_back(&joint);
-      }
-    }
-    std::sort(one_dof_joints.begin(), one_dof_joints.end(),
-              [](const Joint<double>* lhs, const Joint<double>* rhs) {
-                return lhs->position_start() < rhs->position_start();
-              });
-
     std::vector<bool> compact_qpos_covered(nq_, false);
     std::vector<bool> compact_qvel_covered(nv_, false);
     std::vector<bool> drake_qpos_covered(nq_, false);
     std::vector<bool> drake_qvel_covered(nv_, false);
-    int one_dof_cursor = 0;
-
     for (int i = 0; i < joint_count; ++i) {
       const int compact_q = qpos_adr(i);
       const int compact_v = qvel_adr(i);
@@ -666,10 +652,8 @@ class DrakeEnvPool {
       if (kind(i) != kSlideJoint && kind(i) != kHingeJoint) {
         throw std::runtime_error("Unknown MJCF compact joint kind in DrakeUni state layout");
       }
-      if (one_dof_cursor >= static_cast<int>(one_dof_joints.size())) {
-        throw std::runtime_error("MJCF compact state has more one-dof joints than Drake plant");
-      }
-      const Joint<double>& joint = *one_dof_joints.at(one_dof_cursor++);
+      const Joint<double>& joint =
+          FindJointByChildBody(joint_layout_body_names_.at(i), 1, 1);
       const std::string& compact_name = joint_layout_names_.at(i);
       if (!compact_name.empty() && joint.name() != compact_name) {
         throw std::runtime_error("MJCF one-dof joint " + compact_name +
@@ -684,10 +668,6 @@ class DrakeEnvPool {
                   "Drake one-dof qvel layout");
     }
 
-    if (one_dof_cursor != static_cast<int>(one_dof_joints.size())) {
-      throw std::runtime_error(
-          "Drake plant has one-dof joints missing from MJCF compact layout");
-    }
     if (!AllCovered(compact_qpos_covered) || !AllCovered(compact_qvel_covered) ||
         !AllCovered(drake_qpos_covered) || !AllCovered(drake_qvel_covered)) {
       throw std::runtime_error(
