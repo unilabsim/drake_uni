@@ -94,3 +94,30 @@ runtime = create_runtime(
 
 The preferred integration point is `drake_uni.runtime`. `DrakeEnvPool` and
 the compiled extension are lower-level implementation details.
+
+## Native model property readback
+
+`DrakeBatchRuntime.native_model_properties()` returns a cold-path, versioned
+snapshot of the materialized Drake model without exposing Drake objects. The
+current property contract version is 1.
+
+```python
+properties = runtime.native_model_properties()
+assert properties.contract_version == 1
+```
+
+The snapshot contains:
+
+- Drake body order, names, default masses, COM vectors, and full 3×3 rotational
+  inertias. Inertia is about the body origin and expressed in the body frame.
+  The welded world body is reported as a massless static body with zero COM and
+  inertia.
+- SceneGraph geometries in body-index/name order, with normalized names, owner
+  body indices, primitive shape types, native parameters, and proximity-role
+  flags. Numeric arrays are detached and read-only.
+
+Primitive parameters are packed as three native values per geometry: sphere is
+`(radius, 0, 0)`; box and ellipsoid use three full lengths/axes; capsule and
+cylinder use `(radius, length, 0)`; half-space uses zeros. Meshes, convex
+meshes, and other shapes without an exact scalar identity fail closed instead of
+returning misleading parameters.

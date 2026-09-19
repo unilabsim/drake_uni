@@ -5,8 +5,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .batch_env import DrakeEnvPool, batch_available, batch_import_error
     from .runtime import (
+        NATIVE_MODEL_PROPERTIES_CONTRACT_VERSION,
         DrakeBatchConfig,
         DrakeModelInfo,
+        DrakeNativeModelProperties,
         DrakeRuntimeDiagnostics,
         available_backends,
         create_runtime,
@@ -16,7 +18,9 @@ __all__ = [
     "DrakeEnvPool",
     "DrakeBatchConfig",
     "DrakeModelInfo",
+    "DrakeNativeModelProperties",
     "DrakeRuntimeDiagnostics",
+    "NATIVE_MODEL_PROPERTIES_CONTRACT_VERSION",
     "available_backends",
     "batch_available",
     "batch_import_error",
@@ -31,8 +35,10 @@ def __getattr__(name: str):
         return getattr(batch_env, name)
     if name in {
         "DrakeModelInfo",
+        "DrakeNativeModelProperties",
         "DrakeBatchConfig",
         "DrakeRuntimeDiagnostics",
+        "NATIVE_MODEL_PROPERTIES_CONTRACT_VERSION",
         "available_backends",
         "create_runtime",
     }:

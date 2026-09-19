@@ -5,6 +5,7 @@
 #include <Eigen/Dense>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -13,12 +14,14 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
 #include "drake/geometry/scene_graph.h"
 #include "drake/geometry/collision_filter_declaration.h"
 #include "drake/geometry/geometry_set.h"
+#include "drake/geometry/shape_specification.h"
 #include "drake/math/rigid_transform.h"
 #include "drake/multibody/plant/contact_results.h"
 #include "drake/multibody/math/spatial_algebra.h"
@@ -73,7 +76,13 @@ enum ActuatorKind {
 };
 
 using drake::geometry::CollisionFilterDeclaration;
+using drake::geometry::Box;
+using drake::geometry::Capsule;
+using drake::geometry::Cylinder;
+using drake::geometry::Ellipsoid;
+using drake::geometry::HalfSpace;
 using drake::geometry::GeometrySet;
+using drake::geometry::Sphere;
 using drake::geometry::SceneGraph;
 using drake::math::RigidTransform;
 using drake::multibody::BodyIndex;
@@ -207,6 +216,34 @@ struct ThreadWorkspace {
   std::unique_ptr<Simulator<double>> simulator;
   std::vector<double> last_actuator_effort;
 };
+
+struct NativeShapeRecord {
+  std::string type;
+  std::array<double, 3> parameters{};
+};
+
+NativeShapeRecord ReadNativeShape(const drake::geometry::Shape& shape) {
+  return shape.Visit<NativeShapeRecord>([](const auto& value) -> NativeShapeRecord {
+    using ShapeType = std::remove_cvref_t<decltype(value)>;
+    if constexpr (std::is_same_v<ShapeType, Sphere>) {
+      return {"sphere", {value.radius(), 0.0, 0.0}};
+    } else if constexpr (std::is_same_v<ShapeType, Box>) {
+      return {"box", {value.size()(0), value.size()(1), value.size()(2)}};
+    } else if constexpr (std::is_same_v<ShapeType, Capsule>) {
+      return {"capsule", {value.radius(), value.length(), 0.0}};
+    } else if constexpr (std::is_same_v<ShapeType, Cylinder>) {
+      return {"cylinder", {value.radius(), value.length(), 0.0}};
+    } else if constexpr (std::is_same_v<ShapeType, Ellipsoid>) {
+      return {"ellipsoid", {value.a(), value.b(), value.c()}};
+    } else if constexpr (std::is_same_v<ShapeType, HalfSpace>) {
+      return {"half_space", {0.0, 0.0, 0.0}};
+    } else {
+      throw std::runtime_error(
+          "native geometry identity is unsupported for Drake shape " +
+          std::string(value.type_name()));
+    }
+  });
+}
 
 class DrakeEnvPool {
  public:
@@ -410,6 +447,133 @@ class DrakeEnvPool {
     DrakeQposToCompact(q, &state(1), state_layout_);
     DrakeQvelToCompact(v, &state(1 + nq_), state_layout_);
     return state_out;
+  }
+
+  py::dict native_model_properties() const {
+    const int body_count = plant_->num_bodies();
+    std::vector<std::string> body_names;
+    body_names.reserve(static_cast<std::size_t>(body_count));
+    auto masses = MakeArray({body_count});
+    auto coms = MakeArray({body_count, 3});
+    auto inertias = MakeArray({body_count, 3, 3});
+    auto masses_view = masses.mutable_unchecked<1>();
+    auto coms_view = coms.mutable_unchecked<2>();
+    auto inertias_view = inertias.mutable_unchecked<3>();
+
+    std::vector<std::string> geometry_names;
+    std::vector<int> geometry_body_indices;
+    std::vector<std::string> geometry_types;
+    std::vector<bool> geometry_collision;
+    std::vector<double> geometry_parameters;
+    struct NativeGeometryCandidate {
+      std::string name;
+      drake::geometry::GeometryId id;
+      int body_index;
+      bool collision;
+    };
+    std::vector<NativeGeometryCandidate> geometry_candidates;
+    std::unordered_map<std::string, std::size_t> geometry_candidate_indices;
+    const auto& inspector = scene_graph_->model_inspector();
+
+    for (int body_index = 0; body_index < body_count; ++body_index) {
+      const RigidBody<double>& body = plant_->get_body(BodyIndex(body_index));
+      body_names.push_back(body.name());
+      const auto& spatial_inertia = body.default_spatial_inertia();
+      if (body_index == plant_->world_body().index()) {
+        // Drake keeps the welded world body's default SpatialInertia invalid;
+        // expose its stable physical meaning as a massless static body.
+        masses_view(body_index) = 0.0;
+        for (int axis = 0; axis < 3; ++axis) {
+          coms_view(body_index, axis) = 0.0;
+        }
+        for (int row = 0; row < 3; ++row) {
+          for (int column = 0; column < 3; ++column) {
+            inertias_view(body_index, row, column) = 0.0;
+          }
+        }
+      } else {
+        masses_view(body_index) = spatial_inertia.get_mass();
+        const auto& com = spatial_inertia.get_com();
+        for (int axis = 0; axis < 3; ++axis) {
+          coms_view(body_index, axis) = com(axis);
+        }
+        const auto inertia = spatial_inertia.CalcRotationalInertia().CopyToFullMatrix3();
+        for (int row = 0; row < 3; ++row) {
+          for (int column = 0; column < 3; ++column) {
+            inertias_view(body_index, row, column) = inertia(row, column);
+          }
+        }
+      }
+
+      const auto frame_id = plant_->GetBodyFrameIdIfExists(BodyIndex(body_index));
+      if (!frame_id.has_value()) {
+        continue;
+      }
+      for (const auto& geometry_id : inspector.GetGeometries(*frame_id)) {
+        const std::string name = NormalizeGeometryName(inspector.GetName(geometry_id));
+        const bool collision = inspector.GetProximityProperties(geometry_id) != nullptr;
+        auto [existing, inserted] = geometry_candidate_indices.emplace(
+            name, geometry_candidates.size());
+        if (inserted) {
+          geometry_candidates.push_back({name, geometry_id, body_index, collision});
+          continue;
+        }
+        NativeGeometryCandidate& candidate = geometry_candidates.at(existing->second);
+        if (candidate.body_index != body_index || collision == candidate.collision) {
+          throw std::runtime_error(
+              "Duplicate Drake geometry name after normalization: " + name);
+        }
+        if (collision) {
+          // One proximity record is authoritative when Drake registers separate
+          // illustration and proximity instances of the same authored geometry.
+          candidate.id = geometry_id;
+          candidate.collision = true;
+        }
+      }
+    }
+
+    std::sort(
+        geometry_candidates.begin(), geometry_candidates.end(),
+        [](const NativeGeometryCandidate& left, const NativeGeometryCandidate& right) {
+          if (left.body_index != right.body_index) {
+            return left.body_index < right.body_index;
+          }
+          return left.name < right.name;
+        });
+    for (const auto& candidate : geometry_candidates) {
+      const NativeShapeRecord shape = ReadNativeShape(
+          inspector.GetShape(candidate.id));
+      geometry_names.push_back(candidate.name);
+      geometry_body_indices.push_back(candidate.body_index);
+      geometry_types.push_back(shape.type);
+      geometry_collision.push_back(candidate.collision);
+      geometry_parameters.push_back(shape.parameters[0]);
+      geometry_parameters.push_back(shape.parameters[1]);
+      geometry_parameters.push_back(shape.parameters[2]);
+    }
+
+    auto parameters = MakeArray({
+        static_cast<py::ssize_t>(geometry_names.size()),
+        3,
+    });
+    auto parameters_view = parameters.mutable_unchecked<2>();
+    for (std::size_t geometry = 0; geometry < geometry_names.size(); ++geometry) {
+      for (int column = 0; column < 3; ++column) {
+        parameters_view(geometry, column) = geometry_parameters[geometry * 3 + column];
+      }
+    }
+
+    py::dict output;
+    output["body_names"] = body_names;
+    output["body_masses"] = masses;
+    output["body_coms"] = coms;
+    output["body_inertias"] = inertias;
+    output["geometry_names"] = geometry_names;
+    output["geometry_body_indices"] = geometry_body_indices;
+    output["geometry_types"] = geometry_types;
+    output["geometry_collision"] = geometry_collision;
+    output["geometry_parameters"] = parameters;
+    return output;
   }
 
   py::dict step(py::array_t<double, py::array::c_style | py::array::forcecast> state0,
@@ -1406,5 +1570,6 @@ PYBIND11_MODULE(_drake_env_pool, m) {
       .def("reset", &DrakeEnvPool::reset, py::arg("env_ids"), py::arg("initial_state"),
            py::arg("return_sensor") = false)
       .def("default_state", &DrakeEnvPool::default_state)
+      .def("native_model_properties", &DrakeEnvPool::native_model_properties)
       .def("snapshot", &DrakeEnvPool::snapshot, py::arg("return_sensor") = false);
 }
