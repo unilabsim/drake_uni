@@ -11,16 +11,20 @@
 #include <cstddef>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "drake/geometry/scene_graph.h"
 #include "drake/geometry/collision_filter_declaration.h"
+#include "drake/geometry/geometry_roles.h"
 #include "drake/geometry/geometry_set.h"
+#include "drake/geometry/proximity_properties.h"
 #include "drake/geometry/shape_specification.h"
 #include "drake/math/rigid_transform.h"
 #include "drake/multibody/plant/contact_results.h"
@@ -33,9 +37,18 @@
 #include "drake/multibody/tree/model_instance.h"
 #include "drake/multibody/tree/rigid_body.h"
 #include "drake/systems/analysis/simulator.h"
+#include "drake/systems/framework/basic_vector.h"
 #include "drake/systems/framework/context.h"
 #include "drake/systems/framework/diagram.h"
 #include "drake/systems/framework/diagram_builder.h"
+#include "drake/systems/framework/leaf_system.h"
+
+#if defined(__has_include)
+#if __has_include("drake/version.h")
+#include "drake/version.h"
+#define DRAKE_UNI_HAS_DRAKE_VERSION_HEADER 1
+#endif
+#endif
 
 namespace py = pybind11;
 
@@ -245,6 +258,269 @@ NativeShapeRecord ReadNativeShape(const drake::geometry::Shape& shape) {
   });
 }
 
+struct NativeGeometryMaterial {
+  std::string name;
+  bool compliant{};
+  double modulus{};
+  double resolution_hint{};
+  bool has_dissipation{};
+  double dissipation{};
+};
+
+// Native mirror of drake_uni.runtime.DrakePhysicsConfig. The Python runtime
+// validates and serializes the configuration; these parsers re-validate so
+// that invalid combinations fail loudly instead of silently substituting
+// another mode.
+struct NativePhysicsConfig {
+  std::string contact_model = "point";
+  std::string discrete_approximation = "sap";
+  double penetration_allowance = 1.0e-4;
+  std::vector<NativeGeometryMaterial> materials;
+  bool frictionloss_enabled = false;
+  double frictionloss_speed = 0.0;
+  std::vector<double> joint_frictionloss;
+  bool preserve_gravcomp = false;
+  std::unordered_map<std::string, double> body_gravcomp;
+};
+
+std::string RequirePhysicsString(const py::dict& payload, const std::string& key) {
+  if (!payload.contains(key.c_str())) {
+    throw std::invalid_argument("physics payload is missing " + key);
+  }
+  return py::cast<std::string>(payload[key.c_str()]);
+}
+
+double RequirePhysicsDouble(const py::dict& payload, const std::string& key) {
+  if (!payload.contains(key.c_str())) {
+    throw std::invalid_argument("physics payload is missing " + key);
+  }
+  return py::cast<double>(payload[key.c_str()]);
+}
+
+bool RequirePhysicsBool(const py::dict& payload, const std::string& key) {
+  if (!payload.contains(key.c_str())) {
+    throw std::invalid_argument("physics payload is missing " + key);
+  }
+  return py::cast<bool>(payload[key.c_str()]);
+}
+
+std::optional<double> OptionalPhysicsDouble(const py::dict& payload, const std::string& key) {
+  if (!payload.contains(key.c_str()) || payload[key.c_str()].is_none()) {
+    return std::nullopt;
+  }
+  return py::cast<double>(payload[key.c_str()]);
+}
+
+NativePhysicsConfig ParsePhysicsConfig(const py::object& physics) {
+  NativePhysicsConfig config;
+  if (physics.is_none()) {
+    return config;
+  }
+  if (!py::isinstance<py::dict>(physics)) {
+    throw std::invalid_argument("physics must be a dict or None");
+  }
+  const py::dict payload = py::cast<py::dict>(physics);
+  config.contact_model = RequirePhysicsString(payload, "contact_model");
+  if (config.contact_model != "point" && config.contact_model != "hydroelastic" &&
+      config.contact_model != "hydroelastic_with_fallback") {
+    throw std::invalid_argument("unsupported contact_model: " + config.contact_model);
+  }
+  config.discrete_approximation =
+      RequirePhysicsString(payload, "discrete_contact_approximation");
+  if (config.discrete_approximation != "sap" &&
+      config.discrete_approximation != "lagged" &&
+      config.discrete_approximation != "similar") {
+    throw std::invalid_argument(
+        "unsupported discrete_contact_approximation: " + config.discrete_approximation);
+  }
+  config.penetration_allowance = RequirePhysicsDouble(payload, "penetration_allowance");
+  if (!std::isfinite(config.penetration_allowance) || config.penetration_allowance <= 0.0) {
+    throw std::invalid_argument("penetration_allowance must be positive and finite");
+  }
+
+  if (payload.contains("geometry_materials")) {
+    const py::dict materials = py::cast<py::dict>(payload["geometry_materials"]);
+    for (const auto& item : materials) {
+      NativeGeometryMaterial material;
+      material.name = py::cast<std::string>(item.first);
+      const py::dict entry = py::cast<py::dict>(item.second);
+      const std::string hydroelastic_type = RequirePhysicsString(entry, "hydroelastic_type");
+      if (hydroelastic_type == "compliant") {
+        material.compliant = true;
+      } else if (hydroelastic_type != "rigid") {
+        throw std::invalid_argument(
+            "unsupported hydroelastic_type for geometry " + material.name + ": " +
+            hydroelastic_type);
+      }
+      const auto modulus = OptionalPhysicsDouble(entry, "hydroelastic_modulus");
+      const auto hint = OptionalPhysicsDouble(entry, "resolution_hint");
+      if (material.compliant) {
+        if (!modulus.has_value() || !hint.has_value()) {
+          throw std::invalid_argument(
+              "compliant geometry material " + material.name +
+              " requires hydroelastic_modulus and resolution_hint");
+        }
+        if (*modulus <= 0.0 || *hint <= 0.0) {
+          throw std::invalid_argument(
+              "compliant geometry material " + material.name +
+              " requires positive hydroelastic_modulus and resolution_hint");
+        }
+        material.modulus = *modulus;
+        material.resolution_hint = *hint;
+      } else if (modulus.has_value() || hint.has_value()) {
+        throw std::invalid_argument(
+            "rigid geometry material " + material.name +
+            " does not accept hydroelastic_modulus or resolution_hint");
+      }
+      const auto dissipation = OptionalPhysicsDouble(entry, "hunt_crossley_dissipation");
+      if (dissipation.has_value()) {
+        if (*dissipation < 0.0) {
+          throw std::invalid_argument(
+              "hunt_crossley_dissipation must be non-negative for geometry " +
+              material.name);
+        }
+        material.has_dissipation = true;
+        material.dissipation = *dissipation;
+      }
+      config.materials.push_back(std::move(material));
+    }
+  }
+
+  const auto speed = OptionalPhysicsDouble(payload, "frictionloss_regularization_speed");
+  if (speed.has_value()) {
+    if (!std::isfinite(*speed) || *speed <= 0.0) {
+      throw std::invalid_argument("frictionloss_regularization_speed must be positive and finite");
+    }
+    config.frictionloss_enabled = true;
+    config.frictionloss_speed = *speed;
+    const auto losses = py::cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(
+        payload["joint_frictionloss"]);
+    const auto losses_info = losses.request();
+    if (losses_info.ndim != 1) {
+      throw std::invalid_argument("joint_frictionloss must be one-dimensional");
+    }
+    const auto losses_view = losses.unchecked<1>();
+    config.joint_frictionloss.reserve(static_cast<std::size_t>(losses_view.shape(0)));
+    for (py::ssize_t i = 0; i < losses_view.shape(0); ++i) {
+      if (!std::isfinite(losses_view(i)) || losses_view(i) < 0.0) {
+        throw std::invalid_argument("joint_frictionloss entries must be non-negative and finite");
+      }
+      config.joint_frictionloss.push_back(losses_view(i));
+    }
+  }
+  config.preserve_gravcomp = RequirePhysicsBool(payload, "preserve_gravity_compensation");
+  if (config.preserve_gravcomp && payload.contains("body_gravcomp")) {
+    const py::dict gravcomp = py::cast<py::dict>(payload["body_gravcomp"]);
+    for (const auto& item : gravcomp) {
+      config.body_gravcomp.emplace(py::cast<std::string>(item.first),
+                                   py::cast<double>(item.second));
+    }
+  }
+
+  if (config.contact_model == "point" && !config.materials.empty()) {
+    throw std::invalid_argument(
+        "geometry_materials require a hydroelastic contact model; they cannot take "
+        "effect under contact_model='point'");
+  }
+  if (config.contact_model == "hydroelastic" && config.materials.empty()) {
+    throw std::invalid_argument(
+        "contact_model='hydroelastic' is strict: it requires geometry_materials "
+        "assignments for every collision geometry");
+  }
+  return config;
+}
+
+ContactModel ContactModelFromName(const std::string& name) {
+  if (name == "point") {
+    return ContactModel::kPoint;
+  }
+  if (name == "hydroelastic") {
+    return ContactModel::kHydroelastic;
+  }
+  return ContactModel::kHydroelasticWithFallback;
+}
+
+std::string ContactModelName(ContactModel model) {
+  switch (model) {
+    case ContactModel::kPoint:
+      return "point";
+    case ContactModel::kHydroelastic:
+      return "hydroelastic";
+    case ContactModel::kHydroelasticWithFallback:
+      return "hydroelastic_with_fallback";
+  }
+  throw std::runtime_error("unknown Drake contact model");
+}
+
+DiscreteContactApproximation DiscreteApproximationFromName(const std::string& name) {
+  if (name == "sap") {
+    return DiscreteContactApproximation::kSap;
+  }
+  if (name == "lagged") {
+    return DiscreteContactApproximation::kLagged;
+  }
+  return DiscreteContactApproximation::kSimilar;
+}
+
+std::string DiscreteApproximationName(DiscreteContactApproximation approximation) {
+  switch (approximation) {
+    case DiscreteContactApproximation::kSap:
+      return "sap";
+    case DiscreteContactApproximation::kLagged:
+      return "lagged";
+    case DiscreteContactApproximation::kSimilar:
+      return "similar";
+  }
+  throw std::runtime_error("unknown Drake discrete contact approximation");
+}
+
+void RemovePropertyIfPresent(drake::geometry::ProximityProperties* props,
+                             const std::string& group, const std::string& name) {
+  if (props->HasProperty(group, name)) {
+    props->RemoveProperty(group, name);
+  }
+}
+
+struct FrictionlossEntry {
+  int velocity_index{};
+  double frictionloss{};
+  double regularization_speed{};
+};
+
+// Documented approximation for MJCF joint frictionloss, which Drake's MJCF
+// parser ignores. Applies a bounded dissipative generalized force
+// -frictionloss * tanh(v / regularization_speed) per affected single-dof
+// joint: the torque is bounded by the authored dry-friction magnitude,
+// opposes the joint velocity, and is smoothly regularized at the configured
+// speed so the discrete plant remains well-posed at rest.
+class FrictionlossBrake final : public drake::systems::LeafSystem<double> {
+ public:
+  FrictionlossBrake(int num_positions, int num_states, int num_velocities,
+                    std::vector<FrictionlossEntry> entries)
+      : num_positions_(num_positions), entries_(std::move(entries)) {
+    this->DeclareVectorInputPort("plant_state", num_states);
+    this->DeclareVectorOutputPort(
+        "generalized_force", num_velocities, &FrictionlossBrake::CalcForce,
+        {this->input_port_ticket(drake::systems::InputPortIndex(0))});
+  }
+
+ private:
+  void CalcForce(const drake::systems::Context<double>& context,
+                 drake::systems::BasicVector<double>* output) const {
+    Eigen::VectorXd force = Eigen::VectorXd::Zero(output->size());
+    const Eigen::VectorXd& state = this->get_input_port(0).Eval(context);
+    for (const auto& entry : entries_) {
+      const double velocity = state[num_positions_ + entry.velocity_index];
+      force[entry.velocity_index] =
+          -entry.frictionloss * std::tanh(velocity / entry.regularization_speed);
+    }
+    output->SetFromVector(force);
+  }
+
+  int num_positions_{};
+  std::vector<FrictionlossEntry> entries_;
+};
+
 class DrakeEnvPool {
  public:
   DrakeEnvPool(const std::string& model_file, int nbatch, double sim_dt,
@@ -274,7 +550,7 @@ class DrakeEnvPool {
                py::array_t<int, py::array::c_style | py::array::forcecast> sensor_index,
                py::array_t<int, py::array::c_style | py::array::forcecast> sensor_adr,
                py::array_t<int, py::array::c_style | py::array::forcecast> sensor_dim,
-               int nsensordata, int nthread)
+               int nsensordata, int nthread, py::object physics)
       : nbatch_(nbatch),
         sim_dt_(sim_dt),
         ctrl_limits_(std::move(ctrl_limits)),
@@ -306,6 +582,7 @@ class DrakeEnvPool {
     if (nbatch_ < 1) {
       throw std::invalid_argument("nbatch must be >= 1");
     }
+    physics_ = ParsePhysicsConfig(physics);
     nthread_ = std::max(1, std::min(nbatch_, std::max(1, nthread)));
     auto ctrl_info = ctrl_limits_.request();
     if (ctrl_info.ndim != 2 || ctrl_info.shape[1] != 2) {
@@ -362,9 +639,7 @@ class DrakeEnvPool {
         drake::multibody::AddMultibodyPlantSceneGraph(&builder, sim_dt_);
     plant_ = &plant_ref;
     scene_graph_ = &scene_graph_ref;
-    plant_->set_contact_model(ContactModel::kPointContactOnly);
-    plant_->set_discrete_contact_approximation(DiscreteContactApproximation::kSap);
-    plant_->set_penetration_allowance(1.0e-4);
+    ApplyContactSettings();
     const auto model_instances = Parser(plant_).AddModels(model_file);
     if (model_instances.size() != 1) {
       throw std::runtime_error("DrakeEnvPool expected exactly one model instance");
@@ -397,6 +672,8 @@ class DrakeEnvPool {
     // Drake's MJCF parser warns that it ignores MuJoCo contype/conaffinity.
     // Apply the same mask rule ourselves before Finalize().
     num_filtered_geometries_ = ApplyMjcfCollisionFilters();
+    ApplyGeometryMaterials();
+    CacheGravcompForces();
     plant_->Finalize();
     CacheActuatorJointIndices();
     for (int frame_body_index : sensor_frame_body_indices_) {
@@ -409,11 +686,13 @@ class DrakeEnvPool {
         sensor_frame_ref_bodies_.push_back(&plant_->get_body(BodyIndex(frame_body_index)));
       }
     }
-    diagram_ = builder.Build();
 
     nq_ = plant_->num_positions();
     nv_ = plant_->num_velocities();
     state_dim_ = 1 + nq_ + nv_;
+    WireFrictionlossBrake(&builder);
+    diagram_ = builder.Build();
+
     BuildStateLayout();
     if (nu_ != plant_->num_actuators()) {
       throw std::runtime_error("ctrl_limits length does not match plant actuators");
@@ -573,6 +852,51 @@ class DrakeEnvPool {
     output["geometry_types"] = geometry_types;
     output["geometry_collision"] = geometry_collision;
     output["geometry_parameters"] = parameters;
+    return output;
+  }
+
+  // Native effective-settings readback: the values below are queried from the
+  // finalized plant and SceneGraph, never echoed from the request.
+  py::dict effective_physics() const {
+    py::dict output;
+    output["contact_model"] = ContactModelName(plant_->get_contact_model());
+    output["discrete_contact_approximation"] =
+        DiscreteApproximationName(plant_->get_discrete_contact_approximation());
+    output["penetration_allowance"] = plant_->get_penetration_allowance();
+    py::dict materials;
+    const auto& inspector = scene_graph_->model_inspector();
+    for (const auto& [name, geometry_id] : material_geometry_ids_) {
+      const drake::geometry::ProximityProperties* props =
+          inspector.GetProximityProperties(geometry_id);
+      if (props == nullptr) {
+        throw std::runtime_error("Missing proximity properties for geometry " + name);
+      }
+      py::dict entry;
+      const auto compliance =
+          props->GetProperty<drake::geometry::internal::HydroelasticType>(
+              "hydroelastic", "compliance_type");
+      entry["hydroelastic_type"] =
+          drake::geometry::internal::GetStringFromHydroelasticType(compliance);
+      entry["hydroelastic_modulus"] =
+          props->HasProperty("hydroelastic", "hydroelastic_modulus")
+              ? py::cast(props->GetProperty<double>("hydroelastic", "hydroelastic_modulus"))
+              : py::none();
+      entry["resolution_hint"] = props->HasProperty("hydroelastic", "resolution_hint")
+                                     ? py::cast(props->GetProperty<double>("hydroelastic",
+                                                                           "resolution_hint"))
+                                     : py::none();
+      entry["hunt_crossley_dissipation"] =
+          props->HasProperty("material", "hunt_crossley_dissipation")
+              ? py::cast(props->GetProperty<double>("material", "hunt_crossley_dissipation"))
+              : py::none();
+      materials[name.c_str()] = entry;
+    }
+    output["geometry_materials"] = materials;
+#ifdef DRAKE_UNI_HAS_DRAKE_VERSION_HEADER
+    output["drake_version"] = std::string(DRAKE_VERSION_STRING);
+#else
+    output["drake_version"] = py::none();
+#endif
     return output;
   }
 
@@ -1011,7 +1335,7 @@ class DrakeEnvPool {
   void SetExternalBodyForces(
       ThreadWorkspace& runtime, int env_index,
       const py::array_t<double, py::array::c_style | py::array::forcecast>* body_forces) {
-    std::vector<ExternallyAppliedSpatialForce<double>> forces;
+    std::vector<ExternallyAppliedSpatialForce<double>> forces = gravcomp_forces_;
     if (body_forces != nullptr) {
       auto values = body_forces->unchecked<3>();
       for (int body_index = 0; body_index < plant_->num_bodies(); ++body_index) {
@@ -1384,7 +1708,8 @@ class DrakeEnvPool {
     return compact_state_.data() + static_cast<std::size_t>(env_index) * state_dim_;
   }
 
-  int ApplyMjcfCollisionFilters() {
+  std::unordered_map<std::string, drake::geometry::GeometryId> CollisionGeometriesByName()
+      const {
     std::unordered_map<std::string, drake::geometry::GeometryId> geometry_by_name;
     const auto& inspector = scene_graph_->model_inspector();
     for (int body_index = 0; body_index < plant_->num_bodies(); ++body_index) {
@@ -1397,6 +1722,155 @@ class DrakeEnvPool {
         }
       }
     }
+    return geometry_by_name;
+  }
+
+  void ApplyContactSettings() {
+    plant_->set_contact_model(ContactModelFromName(physics_.contact_model));
+    if (plant_->is_discrete()) {
+      plant_->set_discrete_contact_approximation(
+          DiscreteApproximationFromName(physics_.discrete_approximation));
+    } else if (physics_.discrete_approximation != "sap") {
+      throw std::invalid_argument(
+          "discrete_contact_approximation requires a discrete plant (sim_dt > 0)");
+    }
+    plant_->set_penetration_allowance(physics_.penetration_allowance);
+  }
+
+  void ApplyGeometryMaterials() {
+    if (physics_.materials.empty()) {
+      return;
+    }
+    const std::optional<drake::geometry::SourceId> source_id = plant_->get_source_id();
+    if (!source_id.has_value()) {
+      throw std::runtime_error("DrakeEnvPool plant is not registered as a geometry source");
+    }
+    const auto collision = CollisionGeometriesByName();
+    if (physics_.contact_model == "hydroelastic") {
+      // Strict mode: never fall back to point contact. Every collision
+      // geometry must carry an explicit material assignment.
+      std::vector<std::string> missing;
+      for (const auto& [name, geometry_id] : collision) {
+        (void)geometry_id;
+        const bool assigned = std::any_of(
+            physics_.materials.begin(), physics_.materials.end(),
+            [&](const NativeGeometryMaterial& material) { return material.name == name; });
+        if (!assigned) {
+          missing.push_back(name);
+        }
+      }
+      if (!missing.empty()) {
+        std::sort(missing.begin(), missing.end());
+        std::string joined;
+        for (const auto& name : missing) {
+          joined += (joined.empty() ? "" : ", ") + name;
+        }
+        throw std::invalid_argument(
+            "contact_model='hydroelastic' is strict and requires a geometry_materials "
+            "assignment for every collision geometry; missing: " +
+            joined);
+      }
+    }
+    const auto& inspector = scene_graph_->model_inspector();
+    for (const auto& material : physics_.materials) {
+      const auto found = collision.find(material.name);
+      if (found == collision.end()) {
+        throw std::invalid_argument(
+            "geometry_materials refer to unknown collision geometry " + material.name);
+      }
+      const drake::geometry::GeometryId geometry_id = found->second;
+      const drake::geometry::ProximityProperties* existing =
+          inspector.GetProximityProperties(geometry_id);
+      if (existing == nullptr) {
+        throw std::runtime_error(
+            "Collision geometry " + material.name + " has no proximity role in Drake");
+      }
+      // Start from the parsed properties so MJCF-authored contact material
+      // (e.g. Coulomb friction) is preserved, then overwrite the hydroelastic
+      // fields with the requested assignment.
+      drake::geometry::ProximityProperties props(*existing);
+      RemovePropertyIfPresent(&props, "hydroelastic", "compliance_type");
+      RemovePropertyIfPresent(&props, "hydroelastic", "hydroelastic_modulus");
+      RemovePropertyIfPresent(&props, "hydroelastic", "resolution_hint");
+      RemovePropertyIfPresent(&props, "hydroelastic", "slab_thickness");
+      if (material.compliant) {
+        drake::geometry::AddCompliantHydroelasticProperties(material.resolution_hint,
+                                                            material.modulus, &props);
+      } else {
+        drake::geometry::AddRigidHydroelasticProperties(&props);
+      }
+      if (material.has_dissipation) {
+        RemovePropertyIfPresent(&props, "material", "hunt_crossley_dissipation");
+        drake::geometry::AddContactMaterial(material.dissipation, std::nullopt, std::nullopt,
+                                            &props);
+      }
+      scene_graph_->AssignRole(*source_id, geometry_id, props,
+                               drake::geometry::RoleAssign::kReplace);
+      material_geometry_ids_.push_back({material.name, geometry_id});
+    }
+  }
+
+  // Documented approximation for MJCF body gravcomp, which Drake's MJCF
+  // parser ignores: a constant force -gravcomp * mass * gravity applied at
+  // the body center of mass (zero torque), matching MuJoCo's semantics of
+  // compensating that fraction of the body's weight.
+  void CacheGravcompForces() {
+    gravcomp_forces_.clear();
+    if (!physics_.preserve_gravcomp || physics_.body_gravcomp.empty()) {
+      return;
+    }
+    const Eigen::Vector3d gravity = plant_->gravity_field().gravity_vector();
+    for (const auto& [name, fraction] : physics_.body_gravcomp) {
+      const RigidBody<double>& body = plant_->GetBodyByName(name, model_instance_);
+      const auto& inertia = body.default_spatial_inertia();
+      ExternallyAppliedSpatialForce<double> applied;
+      applied.body_index = body.index();
+      applied.p_BoBq_B = inertia.get_com();
+      applied.F_Bq_W = SpatialForce<double>(Eigen::Vector3d::Zero(),
+                                            -fraction * inertia.get_mass() * gravity);
+      gravcomp_forces_.push_back(applied);
+    }
+  }
+
+  void WireFrictionlossBrake(DiagramBuilder<double>* builder) {
+    if (!physics_.frictionloss_enabled) {
+      return;
+    }
+    const int joint_count = static_cast<int>(joint_layout_names_.size());
+    if (static_cast<int>(physics_.joint_frictionloss.size()) != joint_count) {
+      throw std::invalid_argument(
+          "joint_frictionloss must have one entry per MJCF joint layout entry");
+    }
+    auto kind = joint_layout_kind_.unchecked<1>();
+    std::vector<FrictionlossEntry> entries;
+    for (int i = 0; i < joint_count; ++i) {
+      const double loss = physics_.joint_frictionloss.at(i);
+      if (loss == 0.0) {
+        continue;
+      }
+      if (kind(i) != kSlideJoint && kind(i) != kHingeJoint) {
+        throw std::invalid_argument(
+            "the frictionloss approximation only supports single-dof slide/hinge "
+            "joints; nonzero frictionloss on child body " +
+            joint_layout_body_names_.at(i));
+      }
+      const Joint<double>& joint =
+          FindJointByChildBody(joint_layout_body_names_.at(i), 1, 1);
+      entries.push_back(
+          FrictionlossEntry{joint.velocity_start(), loss, physics_.frictionloss_speed});
+    }
+    if (entries.empty()) {
+      return;
+    }
+    auto* brake = builder->AddSystem<FrictionlossBrake>(
+        nq_, plant_->num_multibody_states(), nv_, std::move(entries));
+    builder->Connect(plant_->get_state_output_port(), brake->get_input_port(0));
+    builder->Connect(brake->get_output_port(0),
+                     plant_->get_applied_generalized_force_input_port());
+  }
+
+  int ApplyMjcfCollisionFilters() {
+    const auto geometry_by_name = CollisionGeometriesByName();
 
     int count = 0;
     for (std::size_t pair = 0; pair < collision_filter_geom_names1_.size(); ++pair) {
@@ -1488,6 +1962,9 @@ class DrakeEnvPool {
   int nsensordata_{};
   int nthread_{};
   int num_filtered_geometries_{};
+  NativePhysicsConfig physics_;
+  std::vector<std::pair<std::string, drake::geometry::GeometryId>> material_geometry_ids_;
+  std::vector<ExternallyAppliedSpatialForce<double>> gravcomp_forces_;
   std::unique_ptr<Diagram<double>> diagram_;
   MultibodyPlant<double>* plant_{};
   SceneGraph<double>* scene_graph_{};
@@ -1533,7 +2010,8 @@ PYBIND11_MODULE(_drake_env_pool, m) {
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
                     py::array_t<int, py::array::c_style | py::array::forcecast>,
-                    py::array_t<int, py::array::c_style | py::array::forcecast>, int, int>(),
+                    py::array_t<int, py::array::c_style | py::array::forcecast>, int, int,
+                    py::object>(),
            py::arg("model_file"), py::arg("nbatch"), py::arg("sim_dt"),
            py::arg("ctrl_limits"), py::arg("torque_limits"),
            py::arg("actuator_kind"), py::arg("actuator_gear"),
@@ -1550,7 +2028,7 @@ PYBIND11_MODULE(_drake_env_pool, m) {
            py::arg("sensor_frame_ref_offsets"),
            py::arg("sensor_type"), py::arg("sensor_index"), py::arg("sensor_adr"),
            py::arg("sensor_dim"), py::arg("nsensordata"),
-           py::arg("nthread") = 1)
+           py::arg("nthread") = 1, py::arg("physics") = py::none())
       .def_property_readonly("nbatch", &DrakeEnvPool::nbatch)
       .def_property_readonly("state_dim", &DrakeEnvPool::state_dim)
       .def_property_readonly("num_positions", &DrakeEnvPool::num_positions)
@@ -1571,5 +2049,6 @@ PYBIND11_MODULE(_drake_env_pool, m) {
            py::arg("return_sensor") = false)
       .def("default_state", &DrakeEnvPool::default_state)
       .def("native_model_properties", &DrakeEnvPool::native_model_properties)
+      .def("effective_physics", &DrakeEnvPool::effective_physics)
       .def("snapshot", &DrakeEnvPool::snapshot, py::arg("return_sensor") = false);
 }
