@@ -190,6 +190,8 @@ class MjcfGeomCollisionContract:
     name: str
     contype: int
     conaffinity: int
+    friction: tuple[float, ...] | None = None
+    condim: int = 3
 
     def collides_with(self, other: "MjcfGeomCollisionContract") -> bool:
         return bool((self.contype & other.conaffinity) or (other.contype & self.conaffinity))
@@ -204,6 +206,45 @@ class MjcfJointLayout:
     qvel_adr: int
     qpos_dim: int
     qvel_dim: int
+    frictionloss: float = 0.0
+
+
+@dataclass(frozen=True)
+class MjcfIgnoredPhysicsFields:
+    """MJCF physics fields that Drake's parser ignores, scanned on the cold path.
+
+    Values mirror Drake's MJCF parser warnings: nonzero joint ``frictionloss``
+    and body ``gravcomp`` are dropped, geom torsional/rolling friction
+    components are dropped, and ``condim`` values other than 3 are replaced
+    with 3. DrakeUni's physics configuration can opt into documented
+    approximations for ``frictionloss`` and ``gravcomp``; the other fields have
+    no approximation and are always reported as ignored.
+    """
+
+    joint_frictionloss: dict[str, float]
+    body_gravcomp: dict[str, float]
+    torsional_friction_geoms: tuple[str, ...]
+    rolling_friction_geoms: tuple[str, ...]
+    unsupported_condim_geoms: tuple[str, ...]
+
+    def ignored_field_names(
+        self,
+        *,
+        frictionloss_approximated: bool = False,
+        gravcomp_preserved: bool = False,
+    ) -> tuple[str, ...]:
+        names: list[str] = []
+        if self.joint_frictionloss and not frictionloss_approximated:
+            names.append("joint.frictionloss")
+        if self.body_gravcomp and not gravcomp_preserved:
+            names.append("body.gravcomp")
+        if self.torsional_friction_geoms:
+            names.append("geom.torsional_friction")
+        if self.rolling_friction_geoms:
+            names.append("geom.rolling_friction")
+        if self.unsupported_condim_geoms:
+            names.append("geom.condim")
+        return tuple(names)
 
 
 @dataclass(frozen=True)
@@ -218,6 +259,13 @@ class DrakeMjcfModelContract:
     frame_sensors: tuple[MjcfFrameSensorContract, ...]
     contact_sensors: tuple[MjcfContactSensorContract, ...]
     joint_sensors: tuple[MjcfJointSensorContract, ...]
+    ignored_physics: MjcfIgnoredPhysicsFields
+
+    @property
+    def joint_frictionloss(self) -> np.ndarray:
+        return np.asarray(
+            [layout.frictionloss for layout in self.joint_layouts], dtype=np.float64
+        )
 
     @property
     def ctrl_limits(self) -> np.ndarray:
@@ -437,6 +485,7 @@ def parse_mjcf_model_contract(scene_path: str | Path) -> DrakeMjcfModelContract:
         body_indices,
         {actuator.joint_name: index for index, actuator in enumerate(actuators)},
     )
+    ignored_physics = _collect_ignored_physics_fields(joint_layouts, collision_geoms, roots, defaults)
     return DrakeMjcfModelContract(
         name=roots[0][1].attrib.get("model", path.stem),
         body_indices=body_indices,
@@ -448,7 +497,67 @@ def parse_mjcf_model_contract(scene_path: str | Path) -> DrakeMjcfModelContract:
         frame_sensors=frame_sensors,
         contact_sensors=contact_sensors,
         joint_sensors=joint_sensors,
+        ignored_physics=ignored_physics,
     )
+
+
+def _collect_ignored_physics_fields(
+    joint_layouts: tuple[MjcfJointLayout, ...],
+    collision_geoms: tuple[MjcfGeomCollisionContract, ...],
+    roots: Sequence[tuple[Path, ET.Element]],
+    defaults: dict[str, dict[str, dict[str, str]]],
+) -> MjcfIgnoredPhysicsFields:
+    joint_frictionloss: dict[str, float] = {}
+    for layout in joint_layouts:
+        if layout.frictionloss == 0.0:
+            continue
+        key = layout.name if layout.name else f"body:{layout.body_name}"
+        joint_frictionloss[key] = layout.frictionloss
+    body_gravcomp = _extract_body_gravcomp(roots, defaults)
+    torsional = tuple(
+        geom.name
+        for geom in collision_geoms
+        if geom.friction is not None and len(geom.friction) > 1 and geom.friction[1] != 0.0
+    )
+    rolling = tuple(
+        geom.name
+        for geom in collision_geoms
+        if geom.friction is not None and len(geom.friction) > 2 and geom.friction[2] != 0.0
+    )
+    condim = tuple(geom.name for geom in collision_geoms if geom.condim != 3)
+    return MjcfIgnoredPhysicsFields(
+        joint_frictionloss=joint_frictionloss,
+        body_gravcomp=body_gravcomp,
+        torsional_friction_geoms=torsional,
+        rolling_friction_geoms=rolling,
+        unsupported_condim_geoms=condim,
+    )
+
+
+def _extract_body_gravcomp(
+    roots: Sequence[tuple[Path, ET.Element]],
+    defaults: dict[str, dict[str, dict[str, str]]],
+) -> dict[str, float]:
+    gravcomp: dict[str, float] = {}
+
+    def walk_body(body: ET.Element, inherited_class: str | None) -> None:
+        element_class = body.attrib.get("childclass", inherited_class)
+        attrs = _merged_default_attrs(defaults, element_class, "body", body.attrib)
+        value = float(attrs.get("gravcomp", "0") or 0.0)
+        if value != 0.0:
+            name = body.attrib.get("name")
+            if not name:
+                raise ValueError(
+                    "DrakeUni requires named MJCF bodies when gravcomp is nonzero"
+                )
+            gravcomp[name] = value
+        for child in body.findall("./body"):
+            walk_body(child, element_class)
+
+    for _, root in roots:
+        for body in root.findall("./worldbody/body"):
+            walk_body(body, None)
+    return gravcomp
 
 
 def materialize_drake_compatible_mjcf(scene_path: str | Path) -> DrakeCompatibleMjcf:
@@ -971,7 +1080,7 @@ def _collect_default_classes(
     ) -> None:
         current = {tag: dict(attrs) for tag, attrs in inherited.items()}
         for child in node:
-            if child.tag in {"joint", "geom", "site", *SUPPORTED_ACTUATOR_TAGS}:
+            if child.tag in {"body", "joint", "geom", "site", *SUPPORTED_ACTUATOR_TAGS}:
                 current.setdefault(child.tag, {}).update(child.attrib)
 
         class_name = node.attrib.get("class")
@@ -1105,6 +1214,8 @@ def _extract_geom_collision_fields(
                 name=name,
                 contype=int(attrs.get("contype", "1")),
                 conaffinity=int(attrs.get("conaffinity", "1")),
+                friction=_parse_geom_friction(attrs.get("friction")),
+                condim=int(attrs.get("condim", "3")),
             )
         )
 
@@ -1135,6 +1246,15 @@ def _extract_geom_collision_fields(
     return tuple(geoms)
 
 
+def _parse_geom_friction(text: str | None) -> tuple[float, ...] | None:
+    values = _parse_vector(text)
+    if values is None:
+        return None
+    if values.size > 3:
+        raise ValueError(f"MJCF geom friction must have at most 3 values, got {text!r}")
+    return tuple(float(value) for value in values)
+
+
 def _extract_joint_layouts(
     roots: Sequence[tuple[Path, ET.Element]],
     defaults: dict[str, dict[str, dict[str, str]]],
@@ -1148,6 +1268,7 @@ def _extract_joint_layouts(
         name: str,
         body_name: str,
         joint_type: str,
+        frictionloss: float = 0.0,
     ) -> None:
         nonlocal qpos_adr, qvel_adr
         if joint_type == "free":
@@ -1177,6 +1298,7 @@ def _extract_joint_layouts(
                 qvel_adr=qvel_adr,
                 qpos_dim=qpos_dim,
                 qvel_dim=qvel_dim,
+                frictionloss=frictionloss,
             )
         )
         qpos_adr += qpos_dim
@@ -1204,10 +1326,12 @@ def _extract_joint_layouts(
                 joint_type = attrs.get("type", "hinge").strip().lower()
                 if joint_type == "free" and not body_name:
                     raise ValueError("DrakeUni requires named MJCF bodies for free joint state layout")
+                frictionloss = float(attrs.get("frictionloss", "0") or 0.0)
                 append_joint(
                     name=attrs.get("name", ""),
                     body_name=body_name,
                     joint_type=joint_type,
+                    frictionloss=frictionloss,
                 )
         for child in body.findall("./body"):
             walk_body(child, element_class)

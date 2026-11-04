@@ -10,9 +10,12 @@ import numpy as np
 from drake_uni.batch_env import DrakeEnvPool, batch_available, batch_import_error
 
 from .mjcf_model_parser import (
+    JOINT_KIND_HINGE,
+    JOINT_KIND_SLIDE,
     ROOT_QPOS_DIM,
     ROOT_QVEL_DIM,
     DrakeCompatibleMjcf,
+    DrakeMjcfModelContract,
     materialize_drake_compatible_mjcf,
     parse_mjcf_model_contract,
     read_keyframe_qpos,
@@ -20,9 +23,15 @@ from .mjcf_model_parser import (
 )
 from .types import (
     NATIVE_MODEL_PROPERTIES_CONTRACT_VERSION,
+    PHYSICS_FIELD_STATUS_APPLIED,
+    PHYSICS_FIELD_STATUS_APPROXIMATED,
+    PHYSICS_FIELD_STATUS_IGNORED,
     DrakeBatchConfig,
+    DrakeEffectivePhysics,
+    DrakeGeometryMaterial,
     DrakeModelInfo,
     DrakeNativeModelProperties,
+    DrakePhysicsConfig,
     DrakeRuntimeDiagnostics,
 )
 
@@ -47,6 +56,9 @@ class DrakeBatchRuntime:
         )
         self._model_contract = parse_mjcf_model_contract(self._drake_model.model_file)
         self._nthread = _resolve_nthread(self._num_envs, int(config.nthread))
+        self._physics_payload = _build_physics_payload(
+            config.physics, self._model_contract, self._sim_dt
+        )
         (
             sensor_frame_body_indices,
             sensor_frame_offsets,
@@ -84,6 +96,7 @@ class DrakeBatchRuntime:
             self._model_contract.sensor_dim,
             self._model_contract.nsensordata,
             self._nthread,
+            self._physics_payload,
         )
 
         nq = int(self._pool.num_positions)
@@ -138,6 +151,7 @@ class DrakeBatchRuntime:
             joint_body_names=self._model_contract.joint_layout_body_names,
         )
         self._native_model_properties: DrakeNativeModelProperties | None = None
+        self._effective_physics: DrakeEffectivePhysics | None = None
         self._physics_state = np.zeros((self._num_envs, int(self._pool.state_dim)), dtype=np.float64)
         self._sensor_data = np.zeros(
             (self._num_envs, self._model_info.nsensordata),
@@ -244,6 +258,95 @@ class DrakeBatchRuntime:
                 ),
             )
         return self._native_model_properties
+
+    def effective_physics(self) -> DrakeEffectivePhysics:
+        """Return the validated native effective-physics report.
+
+        The contact model, discrete approximation, penetration allowance and
+        per-geometry material values are read back from the finalized Drake
+        plant and SceneGraph. The per-field status mapping and the ignored
+        MJCF field list are derived from the requested configuration and the
+        cold-path MJCF scan; ``drake_version`` comes from the native build.
+        """
+
+        if self._effective_physics is None:
+            read_native = getattr(self._pool, "effective_physics", None)
+            if not callable(read_native):
+                raise RuntimeError("DrakeEnvPool build does not expose effective_physics")
+            raw = read_native()
+            if not isinstance(raw, dict):
+                raise RuntimeError("DrakeEnvPool effective_physics must return a dict")
+            requested = self._config.physics or DrakePhysicsConfig()
+            contact_model = _require_physics_string(raw, "contact_model")
+            if contact_model != requested.contact_model:
+                raise RuntimeError(
+                    f"DrakeEnvPool applied contact_model={contact_model!r} but "
+                    f"{requested.contact_model!r} was requested"
+                )
+            approximation = _require_physics_string(raw, "discrete_contact_approximation")
+            if approximation != requested.discrete_contact_approximation:
+                raise RuntimeError(
+                    "DrakeEnvPool applied "
+                    f"discrete_contact_approximation={approximation!r} but "
+                    f"{requested.discrete_contact_approximation!r} was requested"
+                )
+            raw_materials = raw.get("geometry_materials")
+            if not isinstance(raw_materials, dict):
+                raise RuntimeError("DrakeEnvPool effective_physics geometry_materials must be a dict")
+            materials: dict[str, DrakeGeometryMaterial] = {}
+            for name in requested.geometry_materials:
+                if name not in raw_materials:
+                    raise RuntimeError(
+                        "DrakeEnvPool effective_physics did not report requested "
+                        f"geometry material {name!r}"
+                    )
+                materials[name] = _material_from_native(name, raw_materials[name])
+            version = raw.get("drake_version")
+            if version is not None and type(version) is not str:
+                raise RuntimeError("DrakeEnvPool effective_physics drake_version must be a string")
+            ignored_physics = self._model_contract.ignored_physics
+            frictionloss_approximated = (
+                requested.frictionloss_regularization_speed is not None
+                and bool(ignored_physics.joint_frictionloss)
+            )
+            gravcomp_preserved = (
+                requested.preserve_gravity_compensation and bool(ignored_physics.body_gravcomp)
+            )
+            field_status: dict[str, str] = {
+                "contact_model": PHYSICS_FIELD_STATUS_APPLIED,
+                "discrete_contact_approximation": PHYSICS_FIELD_STATUS_APPLIED,
+                "penetration_allowance": PHYSICS_FIELD_STATUS_APPLIED,
+            }
+            for name in materials:
+                field_status[f"geometry_materials.{name}"] = PHYSICS_FIELD_STATUS_APPLIED
+            field_status["joint.frictionloss"] = _ignored_or_approximated(
+                ignored_physics.joint_frictionloss, frictionloss_approximated
+            )
+            field_status["body.gravcomp"] = _ignored_or_approximated(
+                ignored_physics.body_gravcomp, gravcomp_preserved
+            )
+            field_status["geom.torsional_friction"] = _ignored_or_absent(
+                ignored_physics.torsional_friction_geoms
+            )
+            field_status["geom.rolling_friction"] = _ignored_or_absent(
+                ignored_physics.rolling_friction_geoms
+            )
+            field_status["geom.condim"] = _ignored_or_absent(
+                ignored_physics.unsupported_condim_geoms
+            )
+            self._effective_physics = DrakeEffectivePhysics(
+                contact_model=contact_model,
+                discrete_contact_approximation=approximation,
+                penetration_allowance=_require_physics_number(raw, "penetration_allowance"),
+                geometry_materials=materials,
+                field_status=field_status,
+                ignored_mjcf_fields=ignored_physics.ignored_field_names(
+                    frictionloss_approximated=frictionloss_approximated,
+                    gravcomp_preserved=gravcomp_preserved,
+                ),
+                drake_version=version,
+            )
+        return self._effective_physics
 
     def keyframe_qpos(self, name: str) -> np.ndarray:
         qpos = read_keyframe_qpos(self._model_file, str(name))
@@ -376,6 +479,122 @@ class DrakeBatchRuntime:
                 f"DrakeEnvPool sensor_data must have shape {expected_shape}, got {sensor_data.shape}"
             )
         self._sensor_data = sensor_data.copy()
+
+
+def _build_physics_payload(
+    physics: DrakePhysicsConfig | None,
+    contract: DrakeMjcfModelContract,
+    sim_dt: float,
+) -> dict[str, Any] | None:
+    """Validate the physics configuration against the model contract and
+    serialize it for the native pool. ``None`` reproduces the historical
+    native defaults (point contact, SAP, penetration_allowance=1e-4)."""
+
+    if physics is None:
+        return None
+    if sim_dt <= 0.0 and physics.discrete_contact_approximation != "sap":
+        raise ValueError(
+            "discrete_contact_approximation requires a discrete plant (sim_dt > 0); "
+            f"got sim_dt={sim_dt}"
+        )
+    collision_names = {geom.name for geom in contract.collision_geoms}
+    unknown = sorted(set(physics.geometry_materials) - collision_names)
+    if unknown:
+        raise ValueError(
+            f"geometry_materials refer to unknown collision geometries: {unknown}"
+        )
+    if physics.contact_model == "hydroelastic":
+        missing = sorted(collision_names - set(physics.geometry_materials))
+        if missing:
+            raise ValueError(
+                "contact_model='hydroelastic' is strict and requires a geometry_materials "
+                f"assignment for every collision geometry; missing: {missing}. Use "
+                "'hydroelastic_with_fallback' for the explicit point-contact fallback mode."
+            )
+    frictionloss = np.zeros(len(contract.joint_layouts), dtype=np.float64)
+    if physics.frictionloss_regularization_speed is not None:
+        unsupported = [
+            layout.name or layout.body_name
+            for layout in contract.joint_layouts
+            if layout.frictionloss != 0.0
+            and layout.kind not in {JOINT_KIND_SLIDE, JOINT_KIND_HINGE}
+        ]
+        if unsupported:
+            raise ValueError(
+                "the frictionloss approximation only supports single-dof slide/hinge "
+                f"joints; nonzero frictionloss on unsupported joints: {unsupported}"
+            )
+        frictionloss = contract.joint_frictionloss.copy()
+    return {
+        "contact_model": physics.contact_model,
+        "discrete_contact_approximation": physics.discrete_contact_approximation,
+        "penetration_allowance": physics.penetration_allowance,
+        "geometry_materials": {
+            name: {
+                "hydroelastic_type": material.hydroelastic_type,
+                "hydroelastic_modulus": material.hydroelastic_modulus,
+                "resolution_hint": material.resolution_hint,
+                "hunt_crossley_dissipation": material.hunt_crossley_dissipation,
+            }
+            for name, material in physics.geometry_materials.items()
+        },
+        "frictionloss_regularization_speed": physics.frictionloss_regularization_speed,
+        "joint_frictionloss": frictionloss,
+        "preserve_gravity_compensation": physics.preserve_gravity_compensation,
+        "body_gravcomp": (
+            dict(contract.ignored_physics.body_gravcomp)
+            if physics.preserve_gravity_compensation
+            else {}
+        ),
+    }
+
+
+def _require_physics_string(output: dict[str, Any], key: str) -> str:
+    value = output.get(key)
+    if type(value) is not str:
+        raise RuntimeError(f"DrakeEnvPool effective_physics {key} must be a string")
+    return value
+
+
+def _require_physics_number(output: dict[str, Any], key: str) -> float:
+    value = output.get(key)
+    if type(value) is bool or not isinstance(value, int | float):
+        raise RuntimeError(f"DrakeEnvPool effective_physics {key} must be a real number")
+    return float(value)
+
+
+def _material_from_native(name: str, value: Any) -> DrakeGeometryMaterial:
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            f"DrakeEnvPool effective_physics geometry material {name!r} must be a dict"
+        )
+    try:
+        return DrakeGeometryMaterial(
+            hydroelastic_type=value["hydroelastic_type"],
+            hydroelastic_modulus=value["hydroelastic_modulus"],
+            resolution_hint=value["resolution_hint"],
+            hunt_crossley_dissipation=value["hunt_crossley_dissipation"],
+        )
+    except KeyError as exc:
+        raise RuntimeError(
+            f"DrakeEnvPool effective_physics geometry material {name!r} is missing {exc}"
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"DrakeEnvPool effective_physics geometry material {name!r} is invalid: {exc}"
+        ) from exc
+
+
+def _ignored_or_approximated(values: Any, approximated: bool) -> str:
+    if not values:
+        return PHYSICS_FIELD_STATUS_APPLIED
+    if approximated:
+        return PHYSICS_FIELD_STATUS_APPROXIMATED
+    return PHYSICS_FIELD_STATUS_IGNORED
+
+
+def _ignored_or_absent(values: tuple[str, ...]) -> str:
+    return PHYSICS_FIELD_STATUS_IGNORED if values else PHYSICS_FIELD_STATUS_APPLIED
 
 
 def _resolve_nthread(num_envs: int, requested: int) -> int:
