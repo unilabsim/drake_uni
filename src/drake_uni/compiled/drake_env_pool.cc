@@ -862,7 +862,9 @@ class DrakeEnvPool {
     output["contact_model"] = ContactModelName(plant_->get_contact_model());
     output["discrete_contact_approximation"] =
         DiscreteApproximationName(plant_->get_discrete_contact_approximation());
-    output["penetration_allowance"] = plant_->get_penetration_allowance();
+    // MultibodyPlant exposes a setter only; report the applied value cached
+    // from the validated configuration.
+    output["penetration_allowance"] = physics_.penetration_allowance;
     py::dict materials;
     const auto& inspector = scene_graph_->model_inspector();
     for (const auto& [name, geometry_id] : material_geometry_ids_) {

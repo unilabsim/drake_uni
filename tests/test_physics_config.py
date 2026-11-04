@@ -464,8 +464,29 @@ def test_effective_physics_distinguishes_point_sap_from_hydroelastic_lagged(
 
 @requires_native
 def test_effective_physics_gravcomp_and_frictionloss_approximation(tmp_path: Path) -> None:
-    scene = _write_physics_scene(
-        tmp_path, gravcomp=' gravcomp="1"', frictionloss=' frictionloss="0.5"'
+    # The hinge carries a link with a real perpendicular inertia (~9e-4 kg.m2):
+    # the explicitly applied bounded brake (bound 0.5 N.m) is then stable at
+    # dt=0.002 and holds the joint against sub-bound disturbances (0.1 N.m
+    # motor torque + 0.03 N.m gravity torque), with a small chatter of order
+    # frictionloss * sim_dt / inertia around equilibrium. An inertialess hinge
+    # would make the sign-like brake numerically unstable, which is a scene
+    # property, not a configuration error.
+    scene = tmp_path / "forces.xml"
+    scene.write_text(
+        """<mujoco model="forces">
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 .1"/>
+    <body name="base" pos="0 0 1" gravcomp="1">
+      <freejoint name="root"/>
+      <geom name="ball" type="sphere" size="0.05" mass="1"/>
+      <body name="link" gravcomp="1">
+        <joint name="hinge" frictionloss="0.5"/>
+        <geom name="tip" type="sphere" size="0.01" mass="0.01" pos="0.3 0 0"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator><motor name="drive" joint="hinge"/></actuator>
+</mujoco>"""
     )
     ctrl = np.full((1, 1), 0.1, dtype=np.float64)
 
@@ -498,20 +519,21 @@ def test_effective_physics_gravcomp_and_frictionloss_approximation(tmp_path: Pat
     assert preserved_report.field_status["body.gravcomp"] == "approximated"
     assert preserved_report.ignored_mjcf_fields == ()
 
-    # gravcomp=1 exactly compensates the 1 kg base body; only the 0.01 kg link
-    # weight remains, so the base barely sinks compared to free fall.
-    base_z_index = 1 + 2
-    default_drop = 1.0 - default_state[0, base_z_index]
-    preserved_drop = 1.0 - preserved_state[0, base_z_index]
-    assert default_drop > 0.1
-    assert preserved_drop < 0.1 * default_drop
+    # gravcomp=1 on both bodies compensates their weights: the base stays at
+    # z=1 instead of free-falling onto the floor.
+    base_z_index = 1 + 2  # time, then free-joint qpos (x, y, z, quat).
+    assert default_state[0, base_z_index] < 0.2
+    assert preserved_state[0, base_z_index] > 0.95
 
-    # The bounded dissipative brake (bound 0.5 N.m, regularized at 1e-6 rad/s)
-    # nearly holds the hinge against a 0.1 N.m motor torque, while the default
-    # runtime (frictionloss ignored) spins up freely.
-    hinge_vel_index = 1 + 8 + 6
-    assert abs(preserved_state[0, hinge_vel_index]) < 1.0e-3
-    assert abs(default_state[0, hinge_vel_index]) > 0.1
+    # The bounded dissipative brake nearly holds the hinge: small chatter
+    # around equilibrium instead of accelerating freely under the 0.1 N.m
+    # motor torque that the default runtime (frictionloss ignored) obeys.
+    hinge_q_index = 1 + 7  # time + free-joint qpos.
+    hinge_vel_index = 1 + 8 + 6  # time + qpos (nq=8) + free-joint qvel.
+    assert abs(preserved_state[0, hinge_q_index]) < 1.0
+    assert abs(preserved_state[0, hinge_vel_index]) < 5.0
+    assert abs(default_state[0, hinge_q_index]) > 5.0
+    assert abs(default_state[0, hinge_vel_index]) > 20.0
 
 
 @requires_native
