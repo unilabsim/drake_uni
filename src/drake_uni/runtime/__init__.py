@@ -12,8 +12,11 @@ from typing import TYPE_CHECKING
 from .types import (
     NATIVE_MODEL_PROPERTIES_CONTRACT_VERSION,
     DrakeBatchConfig,
+    DrakeEffectivePhysics,
+    DrakeGeometryMaterial,
     DrakeModelInfo,
     DrakeNativeModelProperties,
+    DrakePhysicsConfig,
     DrakeRuntimeDiagnostics,
 )
 
@@ -51,8 +54,11 @@ def batch_diagnostics() -> DrakeRuntimeDiagnostics:
 __all__ = [
     "DrakeBatchRuntime",
     "DrakeBatchConfig",
+    "DrakeEffectivePhysics",
+    "DrakeGeometryMaterial",
     "DrakeModelInfo",
     "DrakeNativeModelProperties",
+    "DrakePhysicsConfig",
     "DrakeRuntimeDiagnostics",
     "NATIVE_MODEL_PROPERTIES_CONTRACT_VERSION",
     "available_backends",
